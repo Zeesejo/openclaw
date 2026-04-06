@@ -9,11 +9,27 @@ type AnthropicContentBlock = {
 };
 
 /**
- * Strips dangling tool_use blocks from assistant messages when the immediately
- * following user message does not contain a matching tool_result block.
+ * Strips dangling tool_use blocks from assistant messages when no matching
+ * tool_result block exists anywhere in the conversation.
  * This fixes the "tool_use ids found without tool_result blocks" error from Anthropic.
+ *
+ * Uses a single O(n) pre-pass to build a Set of all tool_result IDs,
+ * then checks membership in O(1) — avoiding the previous O(n²) scan-ahead.
  */
 function stripDanglingAnthropicToolUses(messages: AgentMessage[]): AgentMessage[] {
+  // O(n) pre-pass: collect all tool_result IDs from the entire conversation
+  const allToolResultIds = new Set<string>();
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") continue;
+    const content = (msg as { content?: AnthropicContentBlock[] }).content;
+    if (!Array.isArray(content)) continue;
+    for (const block of content) {
+      if (block && block.type === "toolResult" && block.toolUseId) {
+        allToolResultIds.add(block.toolUseId);
+      }
+    }
+  }
+
   const result: AgentMessage[] = [];
 
   for (let i = 0; i < messages.length; i++) {
@@ -33,43 +49,13 @@ function stripDanglingAnthropicToolUses(messages: AgentMessage[]): AgentMessage[
       content?: AnthropicContentBlock[];
     };
 
-    // Get the next message to check for tool_result blocks
-    const nextMsg = messages[i + 1];
-    const nextMsgRole =
-      nextMsg && typeof nextMsg === "object"
-        ? ((nextMsg as { role?: unknown }).role as string | undefined)
-        : undefined;
-
-    // If next message is not user, keep the assistant message as-is
-    if (nextMsgRole !== "user") {
-      result.push(msg);
-      continue;
-    }
-
-    // Collect tool_use_ids from the next user message's tool_result blocks
-    const nextUserMsg = nextMsg as {
-      content?: AnthropicContentBlock[];
-    };
-    const validToolUseIds = new Set<string>();
-    if (Array.isArray(nextUserMsg.content)) {
-      for (const block of nextUserMsg.content) {
-        if (block && block.type === "toolResult" && block.toolUseId) {
-          validToolUseIds.add(block.toolUseId);
-        }
-      }
-    }
-
-    // Filter out tool_use blocks that don't have matching tool_result
+    // Filter out tool_use blocks whose IDs have no matching tool_result anywhere
     const originalContent = Array.isArray(assistantMsg.content) ? assistantMsg.content : [];
     const filteredContent = originalContent.filter((block) => {
-      if (!block) {
-        return false;
-      }
-      if (block.type !== "toolUse") {
-        return true;
-      }
-      // Keep tool_use if its id is in the valid set
-      return validToolUseIds.has(block.id || "");
+      if (!block) return false;
+      if (block.type !== "toolUse") return true;
+      // O(1) lookup — no scan-ahead needed
+      return allToolResultIds.has(block.id || "");
     });
 
     // If all content would be removed, insert a minimal fallback text block
